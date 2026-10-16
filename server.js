@@ -111,18 +111,21 @@ const regions = [...new Set(orders.map(o=>o.region))];
 const products = [...new Set(orders.map(o=>o.product))];
 const customers = [...new Set(orders.map(o=>o.customer))];
 
-if (/\b(distinct|unique|different)\s+customers?\b/i.test(q)
-    || /\bhow many customers\b/i.test(q)) {
-  return new Set(rows.map(o => o.customer)).size;
-}
+
 
 function detectMetric(q) {
+  // Count orders before checking refund amounts.
+  if (/\b(count|number of|how many orders|orders were|order count)\b/i.test(q)) {
+    return "count";
+  }
   if (/\b(refund|refunded|refunds)\b/i.test(q)) return "refunded";
   if (/\b(void|voided|cancelled|canceled)\b/i.test(q)) return "void";
-  if (/\b(quantity|units|items sold|how many (?:units|items))\b/i.test(q)) return "quantity";
-  if (/\b(count|number of|how many orders|orders were|order count)\b/i.test(q)) return "count";
+  if (/\b(quantity|units|items sold|how many (?:units|items))\b/i.test(q)) {
+    return "quantity";
+  }
   return "revenue";
 }
+
 async function answerQuestion(question) {
   const q = String(question || "").trim();
   if (!q) throw new Error("question is required");
