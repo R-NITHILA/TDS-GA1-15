@@ -1,226 +1,506 @@
+
 import express from "express";
 import fs from "node:fs";
-import crypto from "node:crypto";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-const rawOrders = fs.readFileSync(new URL("./orders.jsonl", import.meta.url), "utf8")
-  .split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+const rawOrders = fs.readFileSync(
+  new URL("./orders.jsonl", import.meta.url),
+  "utf8"
+).split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
 
-// Latest updated_at row is authoritative for each order ID.
+// Keep the latest version of each order.
 const latest = new Map();
+
 for (const row of rawOrders) {
-  const prev = latest.get(row.id);
-  if (!prev || Date.parse(row.updated_at) > Date.parse(prev.updated_at)) latest.set(row.id, row);
+  const previous = latest.get(row.id);
+
+  if (
+    !previous ||
+    Date.parse(row.updated_at) > Date.parse(previous.updated_at)
+  ) {
+    latest.set(row.id, row);
+  }
 }
+
 const orders = [...latest.values()];
 
-const DEFAULT_RATES_URL = process.env.RATES_URL || "";
-const LOCAL_RATES_PATH = new URL("./rates.json", import.meta.url);
+const RATES_URL = process.env.RATES_URL || "";
+const RATES_PATH = new URL("./rates.json", import.meta.url);
 let ratesData = null;
+
 async function loadRates() {
   if (ratesData) return ratesData;
-  try { ratesData = JSON.parse(fs.readFileSync(LOCAL_RATES_PATH, "utf8")); return ratesData; } catch {}
+
+  try {
+    ratesData = JSON.parse(fs.readFileSync(RATES_PATH, "utf8"));
+    return ratesData;
+  } catch {}
+
   if (process.env.RATES_JSON) {
-    try { ratesData = JSON.parse(process.env.RATES_JSON); return ratesData; } catch {}
-  }
-  if (process.env.RATES_FILE && fs.existsSync(process.env.RATES_FILE)) {
-    try { ratesData = JSON.parse(fs.readFileSync(process.env.RATES_FILE, "utf8")); return ratesData; } catch {}
-  }
-  if (DEFAULT_RATES_URL) {
     try {
-      const r = await fetch(DEFAULT_RATES_URL, { signal: AbortSignal.timeout(3500) });
-      if (r.ok) ratesData = await r.json();
-    } catch (e) { console.error("Could not load exchange rates:", e.message); }
+      ratesData = JSON.parse(process.env.RATES_JSON);
+      return ratesData;
+    } catch {}
   }
-  return ratesData;
+
+  if (process.env.RATES_FILE && fs.existsSync(process.env.RATES_FILE)) {
+    try {
+      ratesData = JSON.parse(
+        fs.readFileSync(process.env.RATES_FILE, "utf8")
+      );
+      return ratesData;
+    } catch {}
+  }
+
+  if (RATES_URL) {
+    try {
+      const response = await fetch(RATES_URL, {
+        signal: AbortSignal.timeout(5000)
+      });
+
+      if (response.ok) {
+        ratesData = await response.json();
+        return ratesData;
+      }
+    } catch (error) {
+      console.error("Could not load rates:", error.message);
+    }
+  }
+
+  return null;
 }
+
+// Rates use USD value per unit of currency.
 function getRate(data, from, to) {
   if (from === to) return 1;
   if (!data) return null;
-  // This API defines the USD value of one unit of each currency.
-  // Convert from -> USD -> target using usd_per_unit[from] / usd_per_unit[to].
-  if (data.usd_per_unit && Number.isFinite(Number(data.usd_per_unit[from])) && Number(data.usd_per_unit[from]) > 0
-      && Number.isFinite(Number(data.usd_per_unit[to])) && Number(data.usd_per_unit[to]) > 0) {
-    return Number(data.usd_per_unit[from]) / Number(data.usd_per_unit[to]);
-  }
-  // Accept common shapes: {rates:{EUR:0.9}}, {USD:{EUR:...}},
-  // or {rates:[{from,to,rate}]} / [{base,quote,rate}].
-  const containers = [data, data.rates, data.exchangeRates, data.conversionRates].filter(Boolean);
-  for (const c of containers) {
-    if (Array.isArray(c)) {
-      for (const r of c) {
-        const f = r.from || r.base || r.source || r.currency;
-        const t = r.to || r.quote || r.target || r.targetCurrency;
-        const v = Number(r.rate ?? r.exchange_rate ?? r.value);
-        if (f === from && t === to && Number.isFinite(v)) return v;
-        if (f === to && t === from && Number.isFinite(v) && v !== 0) return 1 / v;
-      }
-    } else if (typeof c === "object") {
-      const direct = Number(c?.[from]?.[to] ?? c?.[from]?.[to.toLowerCase()]);
-      if (Number.isFinite(direct) && direct > 0) return direct;
-      const base = c.base || c.baseCurrency || data.base || data.baseCurrency;
-      const values = c.rates || c;
-      if (base === from && Number.isFinite(Number(values[to]))) return Number(values[to]);
-      if (base === to && Number.isFinite(Number(values[from])) && Number(values[from]) !== 0) return 1 / Number(values[from]);
-      if (from === "USD" && Number.isFinite(Number(values[to]))) return Number(values[to]);
-      if (to === "USD" && Number.isFinite(Number(values[from])) && Number(values[from]) !== 0) return 1 / Number(values[from]);
+
+  if (data.usd_per_unit) {
+    const fromRate = Number(data.usd_per_unit[from]);
+    const toRate = Number(data.usd_per_unit[to]);
+
+    if (
+      Number.isFinite(fromRate) && fromRate > 0 &&
+      Number.isFinite(toRate) && toRate > 0
+    ) {
+      return fromRate / toRate;
     }
   }
-  return null;
-}
-function businessDate(iso) {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit"
-  }).format(new Date(iso));
-}
-function moneyRound(n) { return Math.round((n + Number.EPSILON) * 100) / 100; }
-function monthRange(q) {
-  const m = q.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(20\d{2})\b/i);
-  if (!m) return null;
-  const months = ["january","february","march","april","may","june","july","august","september","october","november","december"];
-  const i = months.indexOf(m[1].toLowerCase()) + 1, y = Number(m[2]);
-  return [`${y}-${String(i).padStart(2,"0")}-01`, `${i === 12 ? y+1 : y}-${String(i === 12 ? 1 : i+1).padStart(2,"0")}-01`];
-}
-function dateFilter(q) {
-  const mr = monthRange(q);
-  if (mr) return d => d >= mr[0] && d < mr[1];
-  const between = q.match(/\bfrom\s+(\d{4}-\d{2}-\d{2})\s+(?:to|through|until)\s+(\d{4}-\d{2}-\d{2})\b/i);
-  if (between) return d => d >= between[1] && d <= between[2];
-  const iso = q.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
-  if (iso) return d => d === iso[1];
-  const year = q.match(/\b(20\d{2})\b/);
-  if (year) return d => d.startsWith(year[1]);
-  return null;
-}
-function extractCurrency(q) {
-  if (/\b(usd|dollars?|US dollars?)\b/i.test(q)) return "USD";
-  if (/\b(eur|euros?)\b/i.test(q)) return "EUR";
-  if (/\b(inr|rupees?|₹)\b/i.test(q)) return "INR";
-  return null;
-}
-function extractFilter(q, field, values) {
-  for (const value of values) {
-    const re = new RegExp(`\\b${String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
-    if (re.test(q)) return value;
+
+  const containers = [
+    data,
+    data.rates,
+    data.exchangeRates,
+    data.conversionRates
+  ].filter(Boolean);
+
+  for (const container of containers) {
+    if (Array.isArray(container)) {
+      for (const item of container) {
+        const fromCurrency =
+          item.from || item.base || item.source || item.currency;
+        const toCurrency =
+          item.to || item.quote || item.target || item.targetCurrency;
+        const rate = Number(
+          item.rate ?? item.exchange_rate ?? item.value
+        );
+
+        if (fromCurrency === from && toCurrency === to &&
+            Number.isFinite(rate) && rate > 0) {
+          return rate;
+        }
+
+        if (fromCurrency === to && toCurrency === from &&
+            Number.isFinite(rate) && rate > 0) {
+          return 1 / rate;
+        }
+      }
+    } else if (typeof container === "object") {
+      const direct = Number(
+        container?.[from]?.[to] ??
+        container?.[from]?.[to.toLowerCase()]
+      );
+
+      if (Number.isFinite(direct) && direct > 0) return direct;
+
+      const base =
+        container.base ||
+        container.baseCurrency ||
+        data.base ||
+        data.baseCurrency;
+
+      const values = container.rates || container;
+
+      if (base === from && Number(values[to]) > 0) {
+        return Number(values[to]);
+      }
+
+      if (base === to && Number(values[from]) > 0) {
+        return 1 / Number(values[from]);
+      }
+
+      if (from === "USD" && Number(values[to]) > 0) {
+        return Number(values[to]);
+      }
+
+      if (to === "USD" && Number(values[from]) > 0) {
+        return 1 / Number(values[from]);
+      }
+    }
   }
+
   return null;
 }
-const regions = [...new Set(orders.map(o=>o.region))];
-const products = [...new Set(orders.map(o=>o.product))];
-const customers = [...new Set(orders.map(o=>o.customer))];
 
+function businessDate(value) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date(value));
+}
 
+function moneyRound(value) {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
 
-function detectMetric(q) {
-  // Count orders before checking refund amounts.
-  if (/\b(count|number of|how many orders|orders were|order count)\b/i.test(q)) {
+function monthRange(question) {
+  const match = question.match(
+    /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(20\d{2})\b/i
+  );
+
+  if (!match) return null;
+
+  const months = [
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december"
+  ];
+
+  const month = months.indexOf(match[1].toLowerCase()) + 1;
+  const year = Number(match[2]);
+  const nextMonth = month === 12 ? 1 : month + 1;
+  const nextYear = month === 12 ? year + 1 : year;
+
+  return [
+    `${year}-${String(month).padStart(2, "0")}-01`,
+    `${nextYear}-${String(nextMonth).padStart(2, "0")}-01`
+  ];
+}
+
+function dateFilter(question) {
+  const range = monthRange(question);
+
+  if (range) {
+    return date => date >= range[0] && date < range[1];
+  }
+
+  const between = question.match(
+    /\bfrom\s+(\d{4}-\d{2}-\d{2})\s+(?:to|through|until)\s+(\d{4}-\d{2}-\d{2})\b/i
+  );
+
+  if (between) {
+    return date => date >= between[1] && date <= between[2];
+  }
+
+  const exactDate = question.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
+
+  if (exactDate) {
+    return date => date === exactDate[1];
+  }
+
+  const year = question.match(/\b(20\d{2})\b/);
+
+  if (year) {
+    return date => date.startsWith(year[1]);
+  }
+
+  return null;
+}
+
+function extractCurrency(question) {
+  if (/\b(usd|us dollars?|dollars?)\b/i.test(question)) return "USD";
+  if (/\b(eur|euros?)\b/i.test(question)) return "EUR";
+  if (/\b(inr|rupees?)\b|₹/i.test(question)) return "INR";
+  return null;
+}
+
+function extractFilter(question, values) {
+  for (const value of values) {
+    if (value == null) continue;
+
+    const escaped = String(value).replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&"
+    );
+
+    if (new RegExp(`\\b${escaped}\\b`, "i").test(question)) {
+      return value;
+    }
+  }
+
+  return null;
+}
+
+const regions = [...new Set(orders.map(order => order.region).filter(Boolean))];
+const products = [...new Set(orders.map(order => order.product).filter(Boolean))];
+const customers = [...new Set(orders.map(order => order.customer).filter(Boolean))];
+
+function detectMetric(question) {
+  // Explicit counting questions must not become revenue sums.
+  if (
+    /\b(count|number of|how many orders|orders were|order count)\b/i.test(question)
+  ) {
     return "count";
   }
-  if (/\b(refund|refunded|refunds)\b/i.test(q)) return "refunded";
-  if (/\b(void|voided|cancelled|canceled)\b/i.test(q)) return "void";
-  if (/\b(quantity|units|items sold|how many (?:units|items))\b/i.test(q)) {
+
+  if (/\b(quantity|units|items sold|how many items|how many units)\b/i.test(question)) {
     return "quantity";
   }
+
+  if (/\b(refund|refunded|refunds)\b/i.test(question)) {
+    return "refunded";
+  }
+
+  if (/\b(void|voided|cancelled|canceled)\b/i.test(question)) {
+    return "void";
+  }
+
   return "revenue";
+}
+
+function isTopQuestion(question) {
+  return /\b(top|most|highest|best-selling|best selling|largest|which product|which customer|rank)\b/i.test(question);
+}
+
+function getGroupField(question) {
+  if (/\bcustomer(?:s)?\b/i.test(question)) return "customer";
+  if (/\bregion\b/i.test(question)) return "region";
+  return "product";
+}
+
+function isDistinctCustomerQuestion(question) {
+  return (
+    /\b(distinct|unique|different)\s+customers?\b/i.test(question) ||
+    /\bhow many customers\b/i.test(question)
+  );
 }
 
 async function answerQuestion(question) {
   const q = String(question || "").trim();
+
   if (!q) throw new Error("question is required");
-  const region = extractFilter(q, "region", regions);
-  const product = extractFilter(q, "product", products);
-  const customer = extractFilter(q, "customer", customers);
-  const status = /\b(refund|refunded|refunds)\b/i.test(q) ? "refunded"
-    : /\bvoid|voided|cancelled|canceled\b/i.test(q) ? "void"
-    : /\bpaid\b/i.test(q) ? "paid" : null;
+
+  const region = extractFilter(q, regions);
+  const product = extractFilter(q, products);
+  const customer = extractFilter(q, customers);
+
+  const status = /\b(refund|refunded|refunds)\b/i.test(q)
+    ? "refunded"
+    : /\b(void|voided|cancelled|canceled)\b/i.test(q)
+      ? "void"
+      : /\bpaid\b/i.test(q)
+        ? "paid"
+        : null;
+
   const targetCurrency = extractCurrency(q) || "USD";
-  const dateFn = dateFilter(q);
-  const timeField = /\b(updated|last updated|update date)\b/i.test(q) ? "updated_at" : "created_at";
-  let rows = orders.filter(o => {
-    if (region && o.region.toLowerCase() !== region.toLowerCase()) return false;
-    if (product && o.product.toLowerCase() !== product.toLowerCase()) return false;
-    if (customer && o.customer.toLowerCase() !== customer.toLowerCase()) return false;
-    if (status && o.status !== status) return false;
-    if (dateFn && !dateFn(businessDate(o[timeField]))) return false;
+  const filterDate = dateFilter(q);
+  const timeField =
+    /\b(updated|last updated|update date)\b/i.test(q)
+      ? "updated_at"
+      : "created_at";
+
+  let rows = orders.filter(order => {
+    if (region && String(order.region).toLowerCase() !== String(region).toLowerCase()) {
+      return false;
+    }
+
+    if (product && String(order.product).toLowerCase() !== String(product).toLowerCase()) {
+      return false;
+    }
+
+    if (customer && String(order.customer).toLowerCase() !== String(customer).toLowerCase()) {
+      return false;
+    }
+
+    if (status && order.status !== status) return false;
+
+    if (
+      filterDate &&
+      (!order[timeField] || !filterDate(businessDate(order[timeField])))
+    ) {
+      return false;
+    }
+
     return true;
   });
 
-  if (/\b(top|most|highest|best-selling|best selling|largest|which product|which customer|rank)\b/i.test(q)
-      && /\b(product|customer|region)\b/i.test(q)) {
-    const groupField = /\bcustomer\b/i.test(q) ? "customer" : /\bregion\b/i.test(q) ? "region" : "product";
+  // Ranking questions: aggregate the requested metric by product/customer/region.
+  if (
+    isTopQuestion(q) &&
+    /\b(product|customer|region)\b/i.test(q)
+  ) {
+    const groupField = getGroupField(q);
     const metric = detectMetric(q);
     const groups = new Map();
-    for (const o of rows) {
-      const key = o[groupField];
-      const val = metric === "quantity" ? o.qty : metric === "count" ? 1 : metric === "refunded" ? (o.status === "refunded" ? o.amount : 0) : (o.status === "paid" ? o.amount : 0);
-      groups.set(key, (groups.get(key) || 0) + val);
+
+    if (metric === "revenue" || metric === "refunded") {
+      const rates = await loadRates();
+
+      // Revenue means paid-order revenue; refunded means refunded amount.
+      const wantedStatus = metric === "refunded" ? "refunded" : "paid";
+
+      for (const order of rows) {
+        if (order.status !== wantedStatus) continue;
+
+        const amount = Number(order.amount);
+        if (!Number.isFinite(amount)) continue;
+
+        const rate = getRate(rates, order.currency, targetCurrency);
+
+        if (rate == null) {
+          throw new Error(
+            `Exchange rate ${order.currency} to ${targetCurrency} is unavailable. Configure rates.json, RATES_JSON, or RATES_URL.`
+          );
+        }
+
+        const key = order[groupField];
+        groups.set(key, (groups.get(key) || 0) + amount * rate);
+      }
+    } else {
+      for (const order of rows) {
+        const key = order[groupField];
+        const value = metric === "quantity"
+          ? Number(order.qty || 0)
+          : 1;
+
+        groups.set(key, (groups.get(key) || 0) + value);
+      }
     }
-    const sorted = [...groups].sort((a,b)=>b[1]-a[1] || a[0].localeCompare(b[0]));
-    const topN = Number(q.match(/\btop\s+(\d+)\b/i)?.[1] || 1);
-    return sorted.slice(0, Math.min(topN, 20)).map(([name,value])=>({[groupField]:name,value:moneyRound(value)}));
+
+    const sorted = [...groups].sort(
+      (a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0]))
+    );
+
+    const topN = Math.min(
+      20,
+      Number(q.match(/\btop\s+(\d+)\b/i)?.[1] || 1)
+    );
+
+    return sorted.slice(0, topN).map(([name, value]) => ({
+      [groupField]: name,
+      value: metric === "count" || metric === "quantity"
+        ? value
+        : moneyRound(value)
+    }));
   }
 
-  if (/\b(list|show|which|what are)\b/i.test(q) && /\border ids?\b/i.test(q)) return rows.map(o=>o.id);
+  if (
+    /\b(list|show|which|what are)\b/i.test(q) &&
+    /\border ids?\b/i.test(q)
+  ) {
+    return rows.map(order => order.id);
+  }
+
+  if (isDistinctCustomerQuestion(q)) {
+    return new Set(rows.map(order => order.customer)).size;
+  }
+
   if (/\baverage|avg\b/i.test(q)) {
     if (!rows.length) return 0;
-    return moneyRound(rows.reduce((s,o)=>s+o.amount,0)/rows.length);
-  }
-  // Distinct-customer questions count unique customer IDs after all filters.
-  // This must run before the generic count metric (which counts orders).
-  if (/\b(distinct|unique|different)\s+customers?\b/i.test(q)
-      || /\bhow many customers\b/i.test(q)) {
-    return new Set(rows.map(o => o.customer)).size;
+
+    const relevant = status
+      ? rows
+      : rows.filter(order => order.status === "paid");
+
+    if (!relevant.length) return 0;
+
+    return moneyRound(
+      relevant.reduce((sum, order) => sum + Number(order.amount || 0), 0) /
+      relevant.length
+    );
   }
 
   const metric = detectMetric(q);
+
   if (metric === "count") return rows.length;
-  if (metric === "quantity") return rows.reduce((s,o)=>s+o.qty,0);
 
-  // Revenue includes only paid orders. Refund questions sum refunded order amounts.
-  const relevant = metric === "refunded" ? rows.filter(o=>o.status==="refunded")
-    : metric === "void" ? rows.filter(o=>o.status==="void")
-    : rows.filter(o=>o.status==="paid");
-
-  const rates = await loadRates();
-  let total = 0;
-  for (const o of relevant) {
-    const rate = getRate(rates, o.currency, targetCurrency);
-    if (rate == null) {
-      if (o.currency !== targetCurrency) {
-        throw new Error(`Exchange rate ${o.currency} to ${targetCurrency} is unavailable. Configure RATES_URL or RATES_JSON.`);
-      }
-      total += o.amount;
-    } else total += o.amount * rate;
+  if (metric === "quantity") {
+    return rows.reduce((sum, order) => sum + Number(order.qty || 0), 0);
   }
+
+  const wantedStatus = metric === "refunded"
+    ? "refunded"
+    : metric === "void"
+      ? "void"
+      : "paid";
+
+  const relevant = rows.filter(order => order.status === wantedStatus);
+  const rates = await loadRates();
+
+  let total = 0;
+
+  for (const order of relevant) {
+    const amount = Number(order.amount);
+
+    if (!Number.isFinite(amount)) continue;
+
+    const rate = getRate(rates, order.currency, targetCurrency);
+
+    if (rate == null) {
+      throw new Error(
+        `Exchange rate ${order.currency} to ${targetCurrency} is unavailable. Configure rates.json, RATES_JSON, or RATES_URL.`
+      );
+    }
+
+    total += amount * rate;
+  }
+
   return moneyRound(total);
 }
 
-app.get("/", (_req,res)=>res.json({
-  service:"Acme Appliances order ledger agent",
-  status:"ok",
-  orderRows:rawOrders.length,
-  currentOrders:orders.length,
-  endpoint:"POST /",
-  body:{question:"What was the total revenue in USD from the North region in March 2026?"}
-}));
-app.get("/health", (_req,res)=>res.json({status:"ok", orders:orders.length}));
-app.post("/", async (req,res)=> {
+app.get("/", (_req, res) => {
+  res.json({
+    service: "Acme Appliances order ledger agent",
+    status: "ok",
+    orderRows: rawOrders.length,
+    currentOrders: orders.length,
+    endpoint: "POST /",
+    body: {
+      question: "In April 2026, what was the top-selling product by revenue (in USD)?"
+    }
+  });
+});
+
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", orders: orders.length });
+});
+
+async function handleQuestion(req, res) {
   try {
-    if (!req.body || typeof req.body.question !== "string") return res.status(400).json({error:"Expected JSON body with a string question"});
+    if (!req.body || typeof req.body.question !== "string") {
+      return res.status(400).json({
+        error: "Expected JSON body with a string question"
+      });
+    }
+
     const answer = await answerQuestion(req.body.question);
-    res.json({answer});
-  } catch (e) {
-    console.error(e);
-    res.status(422).json({error:e.message});
+    return res.json({ answer });
+  } catch (error) {
+    console.error(error);
+    return res.status(422).json({ error: error.message });
   }
-});
-app.post("/ask", async (req,res)=> {
-  try {
-    if (!req.body || typeof req.body.question !== "string") return res.status(400).json({error:"Expected JSON body with a string question"});
-    res.json({answer: await answerQuestion(req.body.question)});
-  } catch (e) { res.status(422).json({error:e.message}); }
-});
+}
+
+app.post("/", handleQuestion);
+app.post("/ask", handleQuestion);
+
 const port = Number(process.env.PORT || 3000);
-app.listen(port, "0.0.0.0", ()=>console.log(`Ledger agent listening on ${port}; current orders: ${orders.length}`));
+
+app.listen(port, "0.0.0.0", () => {
+  console.log(
+    `Ledger agent listening on ${port}; current orders: ${orders.length}`
+  );
+});
